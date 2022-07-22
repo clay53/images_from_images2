@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "images_from_images2_lib",
+    "images_from_images2_cli"
+]
