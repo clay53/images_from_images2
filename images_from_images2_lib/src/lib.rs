@@ -1,4 +1,4 @@
-use std::{path::PathBuf, io::BufReader, num::NonZeroU32};
+use std::{path::PathBuf, num::NonZeroU32, time::Instant};
 
 use image::GenericImageView;
 use log::{warn, trace, error};
@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub enum Error {
+    CantFitSourceImages,
     FailedToLoadTargetImage(std::io::Error),
     FailedToDecodeTargetImage(image::ImageError),
 }
@@ -18,20 +19,33 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
     let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, backend, None).await.unwrap();
     
     let requested_source_image_count = source_image_paths.len() as u32;
-    let max_source_image_count = adapter.limits().max_texture_array_layers;
-    // let max_source_image_count: u32 = 1860; // 1850,1875
-    let source_image_load_count = if max_source_image_count < requested_source_image_count {
-        warn!("Requested more ({}) source images than is supported by the adapter ({})", requested_source_image_count, max_source_image_count);
-        max_source_image_count
-    } else {
-        requested_source_image_count
-    };
-
+    let max_texture_array_layers = adapter.limits().max_texture_array_layers;
     let max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-    println!("Max texture dimension 2d: {}", max_texture_dimension_2d);
+
+    let min_pack_size = requested_source_image_count/max_texture_array_layers + u32::from(requested_source_image_count % max_texture_array_layers != 0);
+    
+    let max_columns = max_texture_dimension_2d/source_width;
+    let max_rows = max_texture_dimension_2d/source_height;
+    
+    let width_prediction = (min_pack_size as f32*source_height as f32/source_width as f32).sqrt();
+
+    let pack_width = if (width_prediction.floor()*source_width as f32*(min_pack_size as f32/width_prediction.floor()).ceil()*source_height as f32) < width_prediction.ceil()*source_width as f32*(min_pack_size as f32/width_prediction.ceil()).ceil()*source_height as f32 && width_prediction.floor() as u32 != 0 {
+        width_prediction.floor() as u32
+    } else {
+        width_prediction.ceil() as u32
+    };
+    let pack_height = min_pack_size/pack_width + u32::from(min_pack_size % pack_width != 0);
+
+    if pack_width > max_columns || pack_height > max_rows {
+        return Err(Error::CantFitSourceImages);
+    }
+
+    let pack_size = pack_width*pack_height;
+    
+    let packs = (requested_source_image_count/pack_size + u32::from(requested_source_image_count % pack_size != 0)).max(2);
 
     let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
-    limits.max_texture_array_layers = source_image_load_count;
+    limits.max_texture_array_layers = packs;
     limits.max_texture_dimension_2d = max_texture_dimension_2d;
     limits.max_storage_textures_per_shader_stage = 1;
     limits.max_compute_workgroup_size_x = 256;
@@ -102,9 +116,9 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
     let source_textures = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Source Textures"),
         size: wgpu::Extent3d {
-            width: source_width,
-            height: source_height,
-            depth_or_array_layers: source_image_load_count,
+            width: source_width*pack_width,
+            height: source_height*pack_height,
+            depth_or_array_layers: packs,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -140,7 +154,17 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
-            }
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ]
     });
 
@@ -183,10 +207,28 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
         multiview: None,
     });
 
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::NoUninit)]
+    struct SourceImageContext {
+        texture_rescale: [f32; 2],
+        p1: [f32; 2],
+        p2: [f32; 2],
+    }
+
+    let source_image_context_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Source Image Context Buffer"),
+        size: std::mem::size_of::<SourceImageContext>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+
+    let mapped_width = 2.0/pack_width as f32;
+    let mapped_height = 2.0/pack_height as f32;
+
     let mut errored = 0;
     let mut i = 0;
-    while i < requested_source_image_count && i-errored < source_image_load_count {
-        trace!("Loading image {} of {}", i-errored+1, source_image_load_count);
+    while i < requested_source_image_count && i-errored < requested_source_image_count {
+        trace!("Loading image {} of {}", i-errored+1, requested_source_image_count);
         let source_image_path = &source_image_paths[i as usize];
         let image = match image::io::Reader::open(source_image_path) {
             Ok(reader) => match reader.decode() {
@@ -235,10 +277,34 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
             texture_size,
         );
 
+        let source_aspect = width as f32/height as f32;
+        let target_aspect = source_width as f32/source_height as f32;
+
+        let texture_rescale = if target_aspect > source_aspect {
+            [source_aspect/target_aspect, 1.0]
+        } else {
+            [1.0, target_aspect/source_aspect]
+        };
+
+        let current_target_index = i-errored;
+        let current_pack = current_target_index/pack_size;
+        let current_pack_index = current_target_index % pack_size;
+        let y = current_pack_index/pack_width;
+        let x = current_pack_index % pack_width;
+
+        let p1 = [-1.0+x as f32*mapped_width, 1.0-y as f32*mapped_height];
+        let p2 = [-1.0+(x+1) as f32*mapped_width, 1.0-(y+1) as f32*mapped_height];
+
+        queue.write_buffer(&source_image_context_buffer, 0, bytemuck::cast_slice(&[SourceImageContext {
+            texture_rescale,
+            p1,
+            p2,
+        }]));
+
         let source_image_view = source_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let target_view = source_textures.create_view(&wgpu::TextureViewDescriptor {
-            base_array_layer: i-errored,
+            base_array_layer: current_pack,
             array_layer_count: std::num::NonZeroU32::new(1),
             ..Default::default()
         });
@@ -254,7 +320,11 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&source_image_sampler)
-                }
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: source_image_context_buffer.as_entire_binding(),
+                },
             ]
         };
 
@@ -285,7 +355,7 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
             &bind_group,
             &[]
         );
-        render_pass.draw(0..3, 0..1);
+        render_pass.draw(0..4, 0..1);
         drop(render_pass);
         queue.submit(std::iter::once(encoder.finish()));
         i += 1;
@@ -293,13 +363,13 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
 
     let source_image_count = i-errored;
 
-    if source_image_count < source_image_load_count {
+    if source_image_count < requested_source_image_count {
         warn!("Did not load all images requested due to too many errors in loading");
     }
 
     // overlay target image
 
-    trace!("Overlaying");
+    trace!("Preparing to overlay");
     let column_count = target_width/source_width;
     let row_count = target_height/source_height;
 
@@ -327,6 +397,9 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
     let overlay_context_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Overlay Context Buffer"),
         contents: bytemuck::cast_slice(&[OverlayContext {
+            pack_size,
+            pack_width,
+            pack_height,
             source_image_count,
             source_width,
             source_height,
@@ -453,19 +526,27 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
         },
         output_texture_size
     );
-
+    trace!("Overlaying");
+    let overlay_timer = Instant::now();
     queue.submit(std::iter::once(encoder.finish()));
+    while !device.poll(wgpu::Maintain::Poll) {
+        
+    }
+    println!("Overlay took: {}", overlay_timer.elapsed().as_millis());
+    trace!("Overlayed");
 
     let buffer_slice = output_buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, |r| {
         if let Err(err) = r {
             error!("Failed to map output buffer: {}", err);
+        } else {
+            trace!("Output buffer mapped!");
         }
     });
 
     trace!("Mapping output buffer...");
     while !device.poll(wgpu::Maintain::Poll) {
-
+        
     }
 
     trace!("Collecting output data...");
@@ -492,6 +573,9 @@ pub async fn go(source_image_paths: &Vec<PathBuf>, source_width: u32, source_hei
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct OverlayContext {
+    pub pack_size: u32,
+    pub pack_width: u32,
+    pub pack_height: u32,
     pub source_image_count: u32,
     pub source_width: u32,
     pub source_height: u32,
